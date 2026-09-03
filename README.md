@@ -89,6 +89,21 @@ visible `content` both draw from the same `max_tokens`. With a tight budget
 expecting a quick, cheap warmup/probe call should budget generously rather
 than assuming a short `max_tokens` implies a short wait.
 
+### Request logs
+
+Each chat-completion request emits correlated lifecycle lines to stdout:
+`received`, `queued`, `fulfilling`, and `completed` (or `rejected`, `failed`,
+or `disconnected`). The completion line reports prompt/completion tokens,
+request, tokenization, queue, prefill, and decode times, decode tok/s and
+ms/token, prompt-cache use, and speculative-decoding accepted/rejected tokens
+with the acceptance percentage. Request IDs match the response's
+`chatcmpl-...` ID. Message contents are not logged; only message/role counts
+and total input characters are included.
+
+```text
+2026-09-03T10:59:27-0700 [chatcmpl-43a1b9d751a4] completed status=200 stream=false finish=stop prompt_tokens=10 completion_tokens=4 total_tokens=14 request_ms=205.4 tokenize_ms=0.2 queue_ms=0.0 prefill_ms=5.2 decode_ms=200.0 tok_s=20.0 ms_per_token=50.0 prefill_tok_s=1153.85 cached_prompt_tokens=4 attempts=1 draft=dflash2 draft_tokens=7 draft_accepted=5 draft_rejected=2 draft_acceptance_pct=71.43
+```
+
 ## 24 GB GPUs (RTX 3090 / 4090)
 
 The kit targets DGX Spark (121 GB) by default. On a 24 GB card the recipe is

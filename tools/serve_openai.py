@@ -44,6 +44,7 @@ PORT = 8888
 
 gen_lock = threading.Lock()          # serialize generation (batch-1 draft)
 stats_lock = threading.Lock()
+log_lock = threading.Lock()
 # Cumulative counters for sparkDash live tok/s (GET /health).
 stats = {
     "prompt_tokens_total": 0,
@@ -68,6 +69,41 @@ def _result_new_tokens(r):
         return int(ids.shape[-1])
     except Exception:
         return 0
+
+def _log_value(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    value = str(value)
+    if re.fullmatch(r"[A-Za-z0-9_./:@,+-]+", value):
+        return value
+    return json.dumps(value, ensure_ascii = False)
+
+
+def log_request(request_id, event, **fields):
+    """Write one atomic, grep-friendly request lifecycle line."""
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    details = " ".join(f"{key}={_log_value(value)}" for key, value in fields.items())
+    line = f"{timestamp} [{request_id}] {event}"
+    if details:
+        line += " " + details
+    with log_lock:
+        print(line, flush = True)
+
+
+def _draft_method(generator):
+    if getattr(generator, "dflash_draft", False):
+        return "dflash2"
+    if getattr(generator, "mtp_draft", False):
+        return "mtp"
+    if getattr(generator, "draft_model", None) is not None:
+        return "draft_model"
+    if getattr(generator, "ngram_match_min", 0):
+        return "ngram"
+    return "none"
 
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
@@ -278,9 +314,9 @@ def tool_choice_directive(tool_choice, tools):
 
 def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   top_p, top_k, seed, tools, tool_choice = None, stop = None,
-                  on_text = None):
-    """Blocking generation; returns (text, tool_calls, finish, p_toks, o_toks,
-    reasoning, content)."""
+                  on_text = None, on_start = None):
+    """Blocking generation; returns text/result fields plus timing metrics."""
+    operation_started = time.perf_counter()
     schemas = build_tool_schemas(tools)
     tools, directive = tool_choice_directive(tool_choice, tools)
     if directive:
@@ -292,17 +328,20 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
             messages[0] = first
         else:
             messages = [{"role": "system", "content": directive}] + messages
+    tokenize_started = time.perf_counter()
     input_ids = tokenizer.hf_chat_template(
         messages, add_generation_prompt = True, enable_thinking = True,
         tools = tools)
+    tokenize_seconds = time.perf_counter() - tokenize_started
     prompt_toks = int(input_ids.shape[-1])
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job
     forced_choice = tool_choice not in (None, "auto", "none")
     reason = "max_new_tokens"
     text = ""
+    attempts = []
 
-    def run_once():
+    def run_once(attempt):
         nonlocal text, reason
         text = ""
         reason = "max_new_tokens"
@@ -312,7 +351,12 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   stop_conditions = stop_conditions,
                   sampler = sampler, seed = seed)
         prefill_seen = 0
+        final_result = {}
+        queue_started = time.perf_counter()
         with gen_lock:
+            queue_seconds = time.perf_counter() - queue_started
+            if on_start is not None:
+                on_start(attempt, prompt_toks, queue_seconds)
             generator.enqueue(job)
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
@@ -321,8 +365,10 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                         if curr > prefill_seen:
                             _bump_stats(prompt=curr - prefill_seen)
                             prefill_seen = curr
-                    elif _result_new_tokens(r):
-                        _bump_stats(completion=_result_new_tokens(r))
+                    else:
+                        new_tokens = _result_new_tokens(r)
+                        if new_tokens:
+                            _bump_stats(completion=new_tokens)
                     chunk = r.get("text", "")
                     if chunk:
                         text += chunk
@@ -330,16 +376,35 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                             on_text(chunk)
                     if r.get("eos"):
                         reason = r.get("eos_reason", reason)
+                        final_result = r
             if prefill_seen < prompt_toks:
                 _bump_stats(prompt=prompt_toks - prefill_seen)
+
+        accepted = int(final_result.get(
+            "accepted_draft_tokens",
+            getattr(job, "accepted_draft_tokens", 0)) or 0)
+        rejected = int(final_result.get(
+            "rejected_draft_tokens",
+            getattr(job, "rejected_draft_tokens", 0)) or 0)
+        attempts.append({
+            "queue_seconds": queue_seconds,
+            "prefill_seconds": float(final_result.get(
+                "time_prefill", getattr(job, "time_prefill", 0.0)) or 0.0),
+            "generation_seconds": float(final_result.get(
+                "time_generate", getattr(job, "time_generate", 0.0)) or 0.0),
+            "accepted_draft_tokens": accepted,
+            "rejected_draft_tokens": rejected,
+            "cached_prompt_tokens": int(final_result.get(
+                "cached_tokens", getattr(job, "cached_tokens", 0)) or 0),
+        })
         return job
 
-    job = run_once()
+    job = run_once(1)
     # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
     # occasionally skip the call. One greedy retry makes it deterministic.
     if forced_choice and not parse_tool_calls(text, schemas)[1]:
         temperature = 0.0
-        job = run_once()
+        job = run_once(2)
     seq = job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
     content, calls = parse_tool_calls(text, schemas)
@@ -350,7 +415,24 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   "stop_condition": "stop", "banned": "content_filter"}.get(
                       reason, "stop")
     reasoning, content = split_reasoning(content)
-    return text, calls, finish, prompt_toks, out_toks, reasoning, content
+
+    accepted = sum(a["accepted_draft_tokens"] for a in attempts)
+    rejected = sum(a["rejected_draft_tokens"] for a in attempts)
+    drafted = accepted + rejected
+    metrics = {
+        "attempts": len(attempts),
+        "tokenize_seconds": tokenize_seconds,
+        "queue_seconds": sum(a["queue_seconds"] for a in attempts),
+        "prefill_seconds": sum(a["prefill_seconds"] for a in attempts),
+        "generation_seconds": sum(a["generation_seconds"] for a in attempts),
+        "cached_prompt_tokens": attempts[-1]["cached_prompt_tokens"],
+        "draft_method": _draft_method(generator),
+        "draft_tokens": drafted,
+        "accepted_draft_tokens": accepted,
+        "rejected_draft_tokens": rejected,
+        "draft_acceptance_rate": accepted / drafted if drafted else None,
+    }
+    return text, calls, finish, prompt_toks, out_toks, reasoning, content, metrics
 
 
 async def models(request):
@@ -404,44 +486,145 @@ def parse_request(body):
     ), None
 
 
+
+def _message_summary(messages):
+    roles = {}
+    input_chars = 0
+    for message in messages:
+        role = str(message.get("role", "unknown"))
+        roles[role] = roles.get(role, 0) + 1
+        content = message.get("content")
+        if isinstance(content, str):
+            input_chars += len(content)
+        elif content is not None:
+            try:
+                input_chars += len(json.dumps(content, ensure_ascii = False))
+            except (TypeError, ValueError):
+                pass
+    return len(messages), ",".join(f"{role}:{count}" for role, count in roles.items()), input_chars
+
+
+def _log_completion(request_id, request_started, stream, finish, prompt_toks,
+                    out_toks, metrics):
+    generation_seconds = metrics["generation_seconds"]
+    prefill_seconds = metrics["prefill_seconds"]
+    uncached_prompt_toks = max(0, prompt_toks - metrics["cached_prompt_tokens"])
+    tok_s = out_toks / generation_seconds if generation_seconds > 0 else None
+    fields = {
+        "status": 200,
+        "stream": stream,
+        "finish": finish,
+        "prompt_tokens": prompt_toks,
+        "completion_tokens": out_toks,
+        "total_tokens": prompt_toks + out_toks,
+        "request_ms": round((time.perf_counter() - request_started) * 1000, 1),
+        "tokenize_ms": round(metrics["tokenize_seconds"] * 1000, 1),
+        "queue_ms": round(metrics["queue_seconds"] * 1000, 1),
+        "prefill_ms": round(prefill_seconds * 1000, 1),
+        "decode_ms": round(generation_seconds * 1000, 1),
+        "tok_s": round(tok_s, 2) if tok_s is not None else None,
+        "ms_per_token": round(1000 / tok_s, 2) if tok_s else None,
+        "prefill_tok_s": round(uncached_prompt_toks / prefill_seconds, 2)
+                         if prefill_seconds > 0 else None,
+        "cached_prompt_tokens": metrics["cached_prompt_tokens"],
+        "attempts": metrics["attempts"],
+        "draft": metrics["draft_method"],
+    }
+    if metrics["draft_method"] != "none":
+        fields.update({
+            "draft_tokens": metrics["draft_tokens"],
+            "draft_accepted": metrics["accepted_draft_tokens"],
+            "draft_rejected": metrics["rejected_draft_tokens"],
+            "draft_acceptance_pct": round(metrics["draft_acceptance_rate"] * 100, 2)
+                                    if metrics["draft_acceptance_rate"] is not None else None,
+        })
+    log_request(request_id, "completed", **fields)
+
+
 async def chat_completions(request):
     app = request.app
     generator, tokenizer = app["generator"], app["tokenizer"]
+    request_started = time.perf_counter()
+    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    log_request(cid, "received", method = request.method, path = request.path,
+                remote = request.remote or "unknown",
+                content_bytes = request.content_length)
     try:
         body = await request.json()
     except web.HTTPRequestEntityTooLarge:
+        message = f"request body exceeds {request.app['max_body_mb']} MiB limit"
+        log_request(cid, "rejected", status = 413, reason = message)
         # aiohttp enforces client_max_size inside request.json(); without this
         # branch it falls into the generic handler below and gets misreported
         # as "invalid JSON" (400) even though the body parsed fine.
         return web.json_response(
-            {"error": {"message": f"request body exceeds {request.app['max_body_mb']} MiB limit",
+            {"error": {"message": message,
                        "type": "invalid_request_error",
                        "code": "request_entity_too_large"}},
             status = 413)
-    except Exception:
+    except Exception as e:
+        log_request(cid, "rejected", status = 400, reason = "invalid_json",
+                    error = type(e).__name__)
         return web.json_response({"error": {"message": "invalid JSON"}}, status = 400)
     req, err = parse_request(body)
     if err:
+        log_request(cid, "rejected", status = 400, reason = err)
         return web.json_response({"error": {"message": err}}, status = 400)
+
+    message_count, roles, input_chars = _message_summary(req["messages"])
+    log_request(
+        cid, "queued",
+        model = req["model_id"],
+        stream = req["stream"],
+        messages = message_count,
+        roles = roles,
+        input_chars = input_chars,
+        max_tokens = req["max_tokens"],
+        temperature = req["temperature"],
+        top_p = req["top_p"],
+        top_k = req["top_k"],
+        seed = req["seed"],
+        tools = len(req["tools"] or []),
+        tool_choice = req["tool_choice"],
+        stops = len(req["stop"] or []),
+    )
+
+    def on_start(attempt, prompt_toks, queue_seconds):
+        log_request(cid, "fulfilling", attempt = attempt,
+                    prompt_tokens = prompt_toks,
+                    queue_ms = round(queue_seconds * 1000, 1),
+                    draft = _draft_method(generator))
 
     import asyncio
     if not req["stream"]:
         try:
-            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
-                generate_full, generator, tokenizer, req["messages"],
-                req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
-                req["seed"], req["tools"], req["tool_choice"], req["stop"])
+            text, calls, finish, ptoks, otoks, reasoning, content, metrics = \
+                await asyncio.to_thread(
+                    generate_full, generator, tokenizer, req["messages"],
+                    req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
+                    req["seed"], req["tools"], req["tool_choice"], req["stop"],
+                    None, on_start)
         except AssertionError as e:
+            log_request(cid, "failed", status = 400, reason = "context_or_cache",
+                        error = str(e))
             return web.json_response(
                 {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
                 status = 400)
+        except Exception as e:
+            log_request(cid, "failed", status = 500, error = type(e).__name__,
+                        detail = str(e),
+                        request_ms = round((time.perf_counter() - request_started) * 1000, 1))
+            return web.json_response(
+                {"error": {"message": "generation failed", "type": "server_error"}},
+                status = 500)
         msg = {"role": "assistant", "content": content or None}
         if reasoning:
             msg["reasoning_content"] = reasoning
         if calls:
             msg["tool_calls"] = calls
+        _log_completion(cid, request_started, False, finish, ptoks, otoks, metrics)
         return web.json_response({
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "id": cid,
             "object": "chat.completion", "created": int(time.time()),
             "model": req["model_id"],
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
@@ -454,12 +637,11 @@ async def chat_completions(request):
         "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
         "Connection": "keep-alive"})
     await resp.prepare(request)
-    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     model_id = req["model_id"]
     req_schemas = build_tool_schemas(req["tools"])
 
     async def run():
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
 
         def on_text(chunk):
@@ -469,15 +651,15 @@ async def chat_completions(request):
 
         def worker():
             try:
-                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
+                result = generate_full(
                     generator, tokenizer, req["messages"], req["max_tokens"],
                     req["temperature"], req["top_p"], req["top_k"],
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                    on_text = None if forced_choice else on_text)
-                loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content)))
+                    on_text = None if forced_choice else on_text,
+                    on_start = on_start)
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
             except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
         loop.run_in_executor(None, worker)
 
         async def send(delta, finish = None):
@@ -543,17 +725,22 @@ async def chat_completions(request):
                 pending = pending[cut:]
                 return
 
+        completed = None
         while True:
             kind, payload = await queue.get()
             if kind == "error":
+                log_request(cid, "failed", status = 500,
+                            error = type(payload).__name__, detail = str(payload),
+                            request_ms = round(
+                                (time.perf_counter() - request_started) * 1000, 1))
                 await resp.write(
-                    f'data: {json.dumps({"error": {"message": payload}})}\n\n'.encode())
+                    f'data: {json.dumps({"error": {"message": str(payload)}})}\n\n'.encode())
                 break
             if kind == "delta":
                 pending += payload
                 await flush_pending()
             elif kind == "done":
-                calls, finish, reasoning, content = payload
+                text, calls, finish, ptoks, otoks, reasoning, content, metrics = payload
                 await flush_pending(final = True)
                 if forced_choice:
                     # Buffered path (no deltas were streamed): emit the
@@ -567,12 +754,17 @@ async def chat_completions(request):
                         await send_call(c)
                 await send({}, finish = finish)
                 await resp.write(b"data: [DONE]\n\n")
+                completed = (finish, ptoks, otoks, metrics)
                 break
         await resp.write_eof()
+        if completed is not None:
+            finish, ptoks, otoks, metrics = completed
+            _log_completion(cid, request_started, True, finish, ptoks, otoks, metrics)
     try:
         await run()
     except ConnectionResetError:
-        pass
+        log_request(cid, "disconnected", stream = True,
+                    request_ms = round((time.perf_counter() - request_started) * 1000, 1))
     return resp
 
 
