@@ -153,6 +153,8 @@ else
 fi
 CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
+REASONING_EFFORT="${REASONING_EFFORT:-low}"
+PRESERVE_THINKING="${PRESERVE_THINKING:-false}"
 
 # --- speculative decoding method ---------------------------------------------
 # DRAFT = mtp | dflash2 | none (see .env.example for the trade-offs).
@@ -221,7 +223,9 @@ cmd=("$PYTHON" -u tools/serve_openai.py
      --host "$HOST"
      --port "$PORT"
      --cache_size "$CONTEXT_SIZE"
-     --grid_size "$GPU_MEM_GB")
+     --grid_size "$GPU_MEM_GB"
+     --default_reasoning_effort "$REASONING_EFFORT"
+     --default_preserve_thinking "$PRESERVE_THINKING")
 
 if [ "$CACHE_QUANT" != "none" ]; then
     cmd+=(--cache_quant "$CACHE_QUANT")

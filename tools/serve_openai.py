@@ -12,9 +12,9 @@ Endpoints:
   GET  /health
   POST /v1/chat/completions   (stream and non-stream, tool calling)
 
-Defaults match the serving convention: temperature 0.6, top-k 20, top-p 0.95,
-thinking enabled (reasoning arrives inline in `<think>`), speculative
-drafting active (drafter chosen via -dm, see above).
+Defaults use Qwen3.8's low reasoning effort, top-k 20 and top-p 0.95.
+Requests can disable thinking or select low/medium/xhigh through the official
+chat-template controls. Speculative drafting remains active by default.
 Concurrency: requests are serialized (batch-1 draft); concurrent callers queue.
 
 Tool calling (Qwen3.8 XML format):
@@ -108,6 +108,10 @@ def _draft_method(generator):
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 HOLD_BACK = 16                       # marker-safe holdback for streamed text
+REASONING_EFFORTS = ("low", "medium", "xhigh")
+CHAT_TEMPLATE_RESERVED = {
+    "add_generation_prompt", "tokenize", "return_dict", "return_tensors", "tools"
+}
 
 
 def build_model(argv, use_draft = True):
@@ -170,9 +174,78 @@ def normalize_messages(messages):
     return out
 
 
+def resolve_chat_template_kwargs(body, defaults = None):
+    """Merge server defaults with Qwen/OpenAI thinking controls."""
+    nested = body.get("chat_template_kwargs")
+    if nested is None:
+        nested = {}
+    elif not isinstance(nested, dict):
+        return None, "`chat_template_kwargs` must be an object"
+
+    reserved = sorted(CHAT_TEMPLATE_RESERVED.intersection(nested))
+    if reserved:
+        return None, (
+            "`chat_template_kwargs` cannot override server-owned fields: "
+            + ", ".join(reserved)
+        )
+
+    kwargs = dict(defaults or {})
+    kwargs.update(nested)
+    for key in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
+        if key not in body:
+            continue
+        if key in nested and nested[key] != body[key]:
+            return None, f"conflicting top-level and chat_template_kwargs `{key}`"
+        kwargs[key] = body[key]
+
+    for key in ("enable_thinking", "preserve_thinking"):
+        if key in kwargs and not isinstance(kwargs[key], bool):
+            return None, f"`{key}` must be a boolean"
+
+    explicit_effort = (
+        "reasoning_effort" in body or "reasoning_effort" in nested
+    )
+    explicit_enable = (
+        "enable_thinking" in body or "enable_thinking" in nested
+    )
+    effort = kwargs.get("reasoning_effort")
+    if effort is not None:
+        if not isinstance(effort, str):
+            return None, "`reasoning_effort` must be a string"
+        effort = effort.lower()
+        if effort == "none":
+            if explicit_enable and kwargs.get("enable_thinking"):
+                return None, "`reasoning_effort: none` conflicts with `enable_thinking: true`"
+            kwargs["enable_thinking"] = False
+            kwargs.pop("reasoning_effort", None)
+        elif effort not in REASONING_EFFORTS:
+            supported = ", ".join(REASONING_EFFORTS)
+            return None, f"`reasoning_effort` must be one of: none, {supported}"
+        else:
+            if explicit_effort and explicit_enable and kwargs.get("enable_thinking") is False:
+                return None, (
+                    f"`reasoning_effort: {effort}` conflicts with "
+                    "`enable_thinking: false`"
+                )
+            kwargs["reasoning_effort"] = effort
+            if explicit_effort:
+                kwargs["enable_thinking"] = True
+
+    if kwargs.get("enable_thinking") is False:
+        kwargs.pop("reasoning_effort", None)
+    return kwargs, None
+
+
+def render_chat_prompt(tokenizer, messages, tools, chat_template_kwargs):
+    """Render one request with the model's native HF chat template."""
+    return tokenizer.hf_chat_template(
+        messages, add_generation_prompt = True, tools = tools,
+        **chat_template_kwargs)
+
+
 def split_reasoning(text):
-    """Split Qwen reasoning from content. Generation starts inside <think>
-    (the chat template ends with it), so text before </think> is reasoning.
+    """Split Qwen reasoning from content when a think block was generated.
+
     Returns (reasoning, content) with markers stripped."""
     close = text.find("</think>")
     if close >= 0:
@@ -312,9 +385,9 @@ def tool_choice_directive(tool_choice, tools):
     return tools, None
 
 
-def generate_full(generator, tokenizer, messages, max_tokens, temperature,
-                  top_p, top_k, seed, tools, tool_choice = None, stop = None,
-                  on_text = None, on_start = None):
+def generate_full(generator, tokenizer, messages, max_tokens, sampling, seed,
+                  tools, tool_choice = None, stop = None, on_text = None,
+                  on_start = None, chat_template_kwargs = None):
     """Blocking generation; returns text/result fields plus timing metrics."""
     operation_started = time.perf_counter()
     schemas = build_tool_schemas(tools)
@@ -329,9 +402,8 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         else:
             messages = [{"role": "system", "content": directive}] + messages
     tokenize_started = time.perf_counter()
-    input_ids = tokenizer.hf_chat_template(
-        messages, add_generation_prompt = True, enable_thinking = True,
-        tools = tools)
+    input_ids = render_chat_prompt(
+        tokenizer, messages, tools, chat_template_kwargs or {})
     tokenize_seconds = time.perf_counter() - tokenize_started
     prompt_toks = int(input_ids.shape[-1])
     from exllamav3.generator.sampler.presets import ComboSampler
@@ -345,7 +417,7 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         nonlocal text, reason
         text = ""
         reason = "max_new_tokens"
-        sampler = ComboSampler(temperature = temperature, top_k = top_k, top_p = top_p)
+        sampler = ComboSampler(**sampling)
         stop_conditions = ["<|im_end|>", tokenizer.eos_token_id] + (stop or [])
         job = Job(input_ids = input_ids, max_new_tokens = max_tokens,
                   stop_conditions = stop_conditions,
@@ -457,15 +529,30 @@ async def health(request):
         })
 
 
-def parse_request(body):
+def parse_request(body, template_defaults = None):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
+    chat_template_kwargs, template_error = resolve_chat_template_kwargs(
+        body, template_defaults)
+    if template_error:
+        return None, template_error
     max_tokens = int(body.get("max_tokens") or
                      body.get("max_completion_tokens") or 1024)
-    temperature = float(body.get("temperature", 0.6))
-    top_p = float(body.get("top_p", 0.95))
+    enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+    temperature = float(body.get("temperature", 1.0 if enable_thinking else 0.7))
+    top_p = float(body.get("top_p", 0.95 if enable_thinking else 0.80))
     top_k = int(body.get("top_k", 20))
+    sampling = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": float(body.get("min_p", 0.0)),
+        "pres_p": float(body.get(
+            "presence_penalty", 0.0 if enable_thinking else 1.5)),
+        "freq_p": float(body.get("frequency_penalty", 0.0)),
+        "rep_p": float(body.get("repetition_penalty", 1.0)),
+    }
     seed = body.get("seed")
     tools = body.get("tools") or None
     stop = body.get("stop")
@@ -475,14 +562,15 @@ def parse_request(body):
         stop = None
     return dict(
         messages = normalize_messages(messages),
-        max_tokens = max_tokens, temperature = temperature,
-        top_p = top_p, top_k = top_k,
+        max_tokens = max_tokens, sampling = sampling,
         seed = int(seed) if seed is not None else None,
         tools = tools,
         tool_choice = body.get("tool_choice"),
         stop = stop,
         stream = bool(body.get("stream", False)),
         model_id = body.get("model", "qwen3.8-27b-exl3-3.5bpw-wm"),
+        chat_template_kwargs = chat_template_kwargs,
+        enable_thinking = enable_thinking,
     ), None
 
 
@@ -566,7 +654,7 @@ async def chat_completions(request):
         log_request(cid, "rejected", status = 400, reason = "invalid_json",
                     error = type(e).__name__)
         return web.json_response({"error": {"message": "invalid JSON"}}, status = 400)
-    req, err = parse_request(body)
+    req, err = parse_request(body, request.app["chat_template_defaults"])
     if err:
         log_request(cid, "rejected", status = 400, reason = err)
         return web.json_response({"error": {"message": err}}, status = 400)
@@ -580,13 +668,20 @@ async def chat_completions(request):
         roles = roles,
         input_chars = input_chars,
         max_tokens = req["max_tokens"],
-        temperature = req["temperature"],
-        top_p = req["top_p"],
-        top_k = req["top_k"],
+        temperature = req["sampling"]["temperature"],
+        top_p = req["sampling"]["top_p"],
+        top_k = req["sampling"]["top_k"],
+        min_p = req["sampling"]["min_p"],
+        presence_penalty = req["sampling"]["pres_p"],
+        frequency_penalty = req["sampling"]["freq_p"],
+        repetition_penalty = req["sampling"]["rep_p"],
         seed = req["seed"],
         tools = len(req["tools"] or []),
         tool_choice = req["tool_choice"],
         stops = len(req["stop"] or []),
+        enable_thinking = req["enable_thinking"],
+        reasoning_effort = req["chat_template_kwargs"].get("reasoning_effort"),
+        preserve_thinking = req["chat_template_kwargs"].get("preserve_thinking"),
     )
 
     def on_start(attempt, prompt_toks, queue_seconds):
@@ -601,9 +696,9 @@ async def chat_completions(request):
             text, calls, finish, ptoks, otoks, reasoning, content, metrics = \
                 await asyncio.to_thread(
                     generate_full, generator, tokenizer, req["messages"],
-                    req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
-                    req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                    None, on_start)
+                    req["max_tokens"], req["sampling"], req["seed"], req["tools"],
+                    req["tool_choice"], req["stop"], None, on_start,
+                    req["chat_template_kwargs"])
         except AssertionError as e:
             log_request(cid, "failed", status = 400, reason = "context_or_cache",
                         error = str(e))
@@ -653,10 +748,11 @@ async def chat_completions(request):
             try:
                 result = generate_full(
                     generator, tokenizer, req["messages"], req["max_tokens"],
-                    req["temperature"], req["top_p"], req["top_k"],
-                    req["seed"], req["tools"], req["tool_choice"], req["stop"],
+                    req["sampling"], req["seed"], req["tools"],
+                    req["tool_choice"], req["stop"],
                     on_text = None if forced_choice else on_text,
-                    on_start = on_start)
+                    on_start = on_start,
+                    chat_template_kwargs = req["chat_template_kwargs"])
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
@@ -671,7 +767,7 @@ async def chat_completions(request):
 
         pending, finish, calls_emitted = "", None, False
         call_idx = [0]
-        in_think = [True]          # generation starts inside <think> (template)
+        in_think = [req["enable_thinking"]]
         THINK_CLOSE = "</think>"
 
         async def send_call(c):
@@ -792,6 +888,12 @@ def main():
                     help = "max request body size in MiB (aiohttp's built-in "
                            "default is 1 MiB, far too small for a full tool "
                            "set + a long transcript)")
+    ap.add_argument("--default_reasoning_effort",
+                    choices = ("none",) + REASONING_EFFORTS, default = "low",
+                    help = "default Qwen reasoning mode: none, low, medium, or xhigh")
+    ap.add_argument("--default_preserve_thinking",
+                    choices = ("true", "false"), default = "false",
+                    help = "retain reasoning from earlier assistant turns by default")
     args = ap.parse_args()
     _draft = args.draft_model.lower()
     use_mtp = _draft == "mtp"
@@ -818,6 +920,13 @@ def main():
     app = web.Application(client_max_size = args.max_body_mb * 1024 * 1024)
     app["generator"] = generator
     app["tokenizer"] = tokenizer
+    effort = args.default_reasoning_effort
+    app["chat_template_defaults"] = {
+        "enable_thinking": effort != "none",
+        "preserve_thinking": args.default_preserve_thinking == "true",
+    }
+    if effort != "none":
+        app["chat_template_defaults"]["reasoning_effort"] = effort
     app["max_body_mb"] = args.max_body_mb
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)

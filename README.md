@@ -78,16 +78,30 @@ DGX Spark with `DRAFT=dflash2`: 8 concurrent requests ran fully sequentially
 — plan capacity accordingly if your workload is concurrent rather than
 single-request.
 
-Reasoning note: the server always reasons — there is currently no way to
-disable it. `chat_template_kwargs.enable_thinking` (the vLLM/SGLang
-convention) is silently ignored. The reasoning trace comes back in a
-separate `reasoning_content` field (both in the full response and in each
-streamed `delta`), but it is **not** a separate token budget: reasoning and
-visible `content` both draw from the same `max_tokens`. With a tight budget
-(e.g. `max_tokens: 16` on a short-answer prompt) I got a response with no
-`content` at all, entirely consumed by the reasoning trace — clients
-expecting a quick, cheap warmup/probe call should budget generously rather
-than assuming a short `max_tokens` implies a short wait.
+Reasoning defaults are deliberately less aggressive than upstream Qwen:
+`REASONING_EFFORT=low` and `PRESERVE_THINKING=false`. Set
+`REASONING_EFFORT=none` in `.env` for direct answers by default, or override
+individual requests with either of the official controls:
+
+```json
+{"chat_template_kwargs":{"enable_thinking":false}}
+```
+
+```json
+{"reasoning_effort":"low"}
+```
+
+Supported efforts are `low`, `medium`, and `xhigh`; `none` is accepted as an
+off alias. Top-level `enable_thinking` / `preserve_thinking` are also accepted
+for Qwen Cloud-compatible clients. Per-request settings override `.env`; a
+conflicting top-level and nested value returns HTTP 400 instead of silently
+choosing one. Reasoning and visible output still share `max_tokens`.
+
+When sampling fields are omitted, the server also selects Qwen's matching
+presets: thinking uses `temperature=1.0`, `top_p=0.95`,
+`presence_penalty=0`; non-thinking uses `temperature=0.7`, `top_p=0.8`,
+`presence_penalty=1.5`; both use `top_k=20`. Requests may override those plus
+`min_p`, `frequency_penalty`, and `repetition_penalty`.
 
 ### Request logs
 

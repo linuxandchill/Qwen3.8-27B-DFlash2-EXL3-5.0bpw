@@ -64,7 +64,7 @@ generator = Generator(model = model, cache = cache, tokenizer = tokenizer)
 job = Job(
     input_ids = tokenizer.encode("Hello!"),
     max_new_tokens = 200,
-    sampler = ComboSampler(temperature = 0.6, top_p = 0.95, top_k = 20),
+    sampler = ComboSampler(temperature = 1.0, top_p = 0.95, top_k = 20),
 )
 generator.enqueue(job)
 while generator.num_remaining_jobs():
@@ -72,9 +72,9 @@ while generator.num_remaining_jobs():
         print(result.get("text") or "", end = "")
 ```
 
-Recommended sampling (Qwen3.8 thinking mode): temperature 0.6, top_p 0.95,
-top_k 20. Thinking can be disabled per-request through the chat template
-(`enable_thinking = False`).
+Recommended sampling (Qwen3.8 thinking mode): temperature 1.0, top_p 0.95,
+top_k 20. The chat template accepts `reasoning_effort = "low" | "medium" |
+"xhigh"` and disables thinking with `enable_thinking = False`.
 
 ## Memory & context
 
