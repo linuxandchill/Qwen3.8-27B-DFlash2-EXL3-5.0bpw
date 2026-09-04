@@ -103,6 +103,111 @@ presets: thinking uses `temperature=1.0`, `top_p=0.95`,
 `presence_penalty=1.5`; both use `top_k=20`. Requests may override those plus
 `min_p`, `frequency_penalty`, and `repetition_penalty`.
 
+### Client-side bounded recovery (Codex and chat UIs)
+
+The server-side controls above are the preferred fix. A client still needs a
+finite recovery policy because an enabled reasoning run can consume its entire
+output budget before emitting visible text, and older OpenAI-compatible servers
+may ignore the template controls. The reliable pattern is:
+
+> Give every attempt a finite token budget, classify how it ended, preserve
+> useful output, retry with a stronger completion constraint, and stop after a
+> fixed number of attempts.
+
+Do not implement this as an unlimited retry loop. An inactivity timer alone is
+also insufficient: a model continuously streaming reasoning tokens is active,
+even if it never reaches an answer. The token cap must eventually return
+control to the client.
+
+#### Web chat adapter
+
+Use a larger first-attempt budget because the user expects one substantial
+answer:
+
+```json
+{"stream":true,"max_tokens":16384}
+```
+
+While consuming SSE, track reasoning, visible content, tool calls,
+`finish_reason`, bytes received, and the time of the most recent event. A
+practical set of guards is:
+
+- abort after 120 seconds with no SSE data;
+- abort after 1 MiB of response data;
+- buffer fragmented SSE lines until a complete event is available;
+- treat a closed stream without a terminal event as incomplete;
+- always settle the UI message as complete or incomplete so its spinner stops.
+
+Classify the completed attempt as follows:
+
+1. A complete visible answer or valid tool call: finish normally.
+2. Visible text with `finish_reason: "length"`: retain it and make one
+   continuation request. Add the partial text as the latest assistant message,
+   instruct the model to continue exactly where it stopped without repeating
+   the answer, then append the new text to the same UI message.
+3. Reasoning but no visible text or tool call: make one forced-answer request.
+   Include the prior reasoning as context, instruct the model to stop planning,
+   and require a private `respond_to_user` tool:
+
+```json
+{
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "respond_to_user",
+      "description": "Return the final answer to the user.",
+      "parameters": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"]
+      }
+    }
+  }],
+  "tool_choice": {
+    "type": "function",
+    "function": {"name": "respond_to_user"}
+  }
+}
+```
+
+Extract the `answer` argument and render it as ordinary assistant text; do not
+show the private tool call. If the backend rejects tools, ignores the forced
+choice, or returns malformed arguments, make one final tool-free continuation
+request with the same “final answer now” instruction. If that fails, surface a
+visible error. The complete sequence is bounded:
+
+```text
+normal request
+  -> partial-answer continuation, or
+  -> forced respond_to_user call
+       -> tool-free final-answer fallback
+            -> visible error
+```
+
+#### Codex-style tool harness
+
+Agentic harnesses should yield control more frequently. Cap each model turn at
+about 4,096 completion tokens, then detect this exact failure state:
+
+```text
+finish_reason == "length"
+and reasoning is non-empty
+and visible content is empty
+and no tool call was produced
+```
+
+Retry that turn once with `temperature: 0`, another 4,096-token cap, and
+`tool_choice: "required"`. Feed the recovered tool call into the same logical
+harness turn so the executor can run it. If the retry still produces no action,
+terminate the turn with an explicit error rather than recursively retrying.
+
+The different budgets are intentional: web chat optimizes for one useful
+answer, while a tool harness optimizes for the short
+`reason -> tool -> observation` cycle. This recovery layer handles
+reasoning-only output, truncation, malformed tool results, inactive or
+disconnected streams, and missing completion events. It cannot recover an
+inference process that has actually crashed or stopped servicing requests.
+
 ### Request logs
 
 Each chat-completion request emits correlated lifecycle lines to stdout:
